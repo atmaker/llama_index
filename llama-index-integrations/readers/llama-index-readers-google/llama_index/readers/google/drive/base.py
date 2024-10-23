@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from tqdm import tqdm
 from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -52,7 +53,7 @@ class GoogleDriveReader(
             file. Defaults to None.
         client_config (Optional[dict]): Dictionary containing client config.
             Defaults to None.
-        authorized_user_info (Optional[dict]): Dicstionary containing authorized
+        authorized_user_info (Optional[dict]): Dictionary containing authorized
             user info. Defaults to None.
         service_account_key (Optional[dict]): Dictionary containing service
             account key. Defaults to None.
@@ -90,7 +91,7 @@ class GoogleDriveReader(
         client_config: Optional[dict] = None,
         authorized_user_info: Optional[dict] = None,
         service_account_key: Optional[dict] = None,
-        file_extractor: Optional[Dict[str, Union[str, BaseReader]]] = None,
+        file_extractor: Optional[Dict[str, BaseReader]] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize with parameters."""
@@ -396,15 +397,23 @@ class GoogleDriveReader(
                 f"An error occurred while downloading file: {e}", exc_info=True
             )
 
-    def _load_data_fileids_meta(self, fileids_meta: List[List[str]]) -> List[Document]:
+    def _load_data_fileids_meta(
+        self,
+        fileids_meta: List[List[str]],
+        show_progress: bool = True,
+        num_workers: Optional[int] = None,
+    ) -> List[Document]:
         """Load data from fileids metadata
         Args:
             fileids_meta: metadata of fileids in google drive.
 
         Returns:
-            Lis[Document]: List of Document of data present in fileids.
+            List[Document]: List of Document of data present in fileids.
         """
         try:
+            file_extractor = (
+                self.file_extractor if self.file_extractor is not None else None
+            )
             with tempfile.TemporaryDirectory() as temp_dir:
 
                 def get_metadata(filename):
@@ -413,7 +422,17 @@ class GoogleDriveReader(
                 temp_dir = Path(temp_dir)
                 metadata = {}
 
-                for fileid_meta in fileids_meta:
+                if show_progress:
+                    files_to_process = tqdm(
+                        fileids_meta,
+                        desc="Downloading from Drive",
+                        total=len(fileids_meta),
+                        unit="file",
+                    )
+                else:
+                    files_to_process = fileids_meta
+
+                for fileid_meta in files_to_process:
                     # Download files and name them with their fileid
                     fileid = fileid_meta[0]
                     filepath = os.path.join(temp_dir, fileid)
@@ -428,10 +447,48 @@ class GoogleDriveReader(
                         "created at": fileid_meta[4],
                         "modified at": fileid_meta[5],
                     }
+
+                    default_file_reader_classes = (
+                        SimpleDirectoryReader.supported_suffix_fn()
+                    )
+                    default_file_reader_suffix = list(
+                        default_file_reader_classes.keys()
+                    )
+                    final_filepath = Path(final_filepath)
+
+                    logger.info(f"Loading file: {final_filepath}")
+
+                    if final_filepath and final_filepath.suffix:
+                        file_suffix = final_filepath.suffix.lower()
+
+                        # Use dedicated file reader based on the file extension
+                        if (
+                            file_suffix in default_file_reader_suffix
+                            or file_suffix in file_extractor
+                        ):
+                            # Instantiate file reader if not already done
+                            if file_extractor is None or (
+                                file_extractor is not None
+                                and file_suffix not in file_extractor
+                            ):
+                                reader_class = default_file_reader_classes[file_suffix]
+
+                                file_extractor: Dict[str, BaseReader] = {}
+                                file_extractor[file_suffix] = reader_class()
+
+                            logger.info(f"Using custom reader for {file_suffix}.")
+                        else:
+                            logger.info(
+                                f"No file extension found. Falling back to default reader."
+                            )
+
                 loader = SimpleDirectoryReader(
-                    temp_dir,
-                    file_extractor=self.file_extractor,
+                    input_dir=temp_dir,
+                    recursive=True,
+                    file_extractor=file_extractor or None,
                     file_metadata=get_metadata,
+                    errors="ignore",
+                    raise_on_error=False,
                 )
                 documents = loader.load_data()
                 for doc in documents:
@@ -529,6 +586,7 @@ class GoogleDriveReader(
         Returns:
             List[Document]: A list of documents.
         """
+        documents: List[Document] = []
         self._creds = self._get_credentials()
 
         # If no arguments are provided to load_data, default to the object attributes
@@ -542,14 +600,18 @@ class GoogleDriveReader(
             query_string = self.query_string
 
         if folder_id:
-            return self._load_from_folder(drive_id, folder_id, mime_types, query_string)
+            documents = self._load_from_folder(
+                drive_id, folder_id, mime_types, query_string
+            )
+
         elif file_ids:
-            return self._load_from_file_ids(
+            documents = self._load_from_file_ids(
                 drive_id, file_ids, mime_types, query_string
             )
         else:
             logger.warning("Either 'folder_id' or 'file_ids' must be provided.")
-            return []
+
+        return documents
 
     def list_resources(self, **kwargs) -> List[str]:
         """List resources in the specified Google Drive folder or files."""
